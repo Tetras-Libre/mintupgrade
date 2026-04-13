@@ -4,7 +4,7 @@
 mintupgrade-cli — Command-line interface for the Linux Mint Upgrade Tool.
 
 Usage:
-  mintupgrade-cli                    Run the full interactive upgrade wizard
+  mintupgrade-cli                    Run pre-upgrade checks (safe default)
   mintupgrade-cli check              Run pre-upgrade checks only (no changes)
   mintupgrade-cli upgrade            Run the full upgrade non-interactively
   mintupgrade-cli --help / -h        Show this help message
@@ -14,16 +14,15 @@ Options:
   --skip-timeshift                   Skip the Timeshift snapshot check
   --skip-version                     Skip the OS version check
   --skip-updates                     Skip the up-to-date check
-  --yes / -y                         Auto-confirm informational prompts (orphan packages, simulation summary)
+  --yes / -y                         Auto-confirm informational prompts
 """
 
 import sys
 import os
 import argparse
-import subprocess
+import re
 import traceback
 import time
-import datetime
 
 # ---------------------------------------------------------------------------
 # Bootstrap: allow running directly from the source tree or installed path
@@ -67,10 +66,13 @@ class C:
     CYAN    = "\033[96m"
     WHITE   = "\033[97m"
 
+
 def _c(color, text):
+    """Wrap text with ANSI color codes, or return plain text if color disabled."""
     if USE_COLOR:
-        return f"{color}{text}{C.RESET}"
+        return f"{C.RESET}{color}{text}{C.RESET}"
     return text
+
 
 def header(text):
     width = 60
@@ -80,25 +82,37 @@ def header(text):
     print(_c(C.BOLD + C.CYAN, f"║  {text:<{width-2}}║"))
     print(_c(C.BOLD + C.CYAN, f"╚{bar}╝"))
 
+
 def section(text):
     print()
     print(_c(C.BOLD + C.BLUE, f"  ▶  {text}"))
     print(_c(C.BLUE, "  " + "─" * 55))
 
+
 def ok(text):
     print(_c(C.GREEN,   f"  ✔  {text}"))
+
 
 def info(text):
     print(_c(C.CYAN,    f"  ℹ  {text}"))
 
+
 def warn(text):
     print(_c(C.YELLOW,  f"  ⚠  {text}"))
+
 
 def error(text):
     print(_c(C.RED,     f"  ✘  {text}"))
 
+
 def fatal(text):
     print(_c(C.BOLD + C.RED, f"\n  ✘  FATAL: {text}\n"))
+
+
+def strip_pango(text):
+    """Remove all Pango/HTML markup tags from a string."""
+    return re.sub(r'<[^>]+>', '', text)
+
 
 def print_table(table_list):
     """Pretty-print a TableList to the terminal."""
@@ -111,6 +125,7 @@ def print_table(table_list):
     for row in table_list.values:
         print("      " + "  |  ".join(str(v) for v in row))
 
+
 def render_info(info_list):
     """Render check.info (mixed strings / TableList) to the terminal."""
     for item in info_list:
@@ -119,12 +134,11 @@ def render_info(info_list):
         elif item == "---":
             print("  " + "─" * 55)
         else:
-            # Strip pango markup (<b>, etc.)
-            clean = item.replace("<b>", "").replace("</b>", "")
-            info(clean)
+            info(strip_pango(item))
+
 
 # ---------------------------------------------------------------------------
-# Synchronous check runner  (the GUI uses threads + GLib.idle_add)
+# Synchronous check runner
 # ---------------------------------------------------------------------------
 
 def run_check_sync(check):
@@ -137,6 +151,7 @@ def run_check_sync(check):
         check.result = RESULT_EXCEPTION
     check.finished = True
     return check
+
 
 # ---------------------------------------------------------------------------
 # Interactive prompt helpers
@@ -154,6 +169,7 @@ def ask_yesno(prompt, default_yes=False):
         return default_yes
     return answer in ("y", "yes")
 
+
 def ask_continue(auto_yes=False):
     """Ask the user whether to continue after a warning/info."""
     if auto_yes:
@@ -161,22 +177,31 @@ def ask_continue(auto_yes=False):
         return True
     return ask_yesno("Continue anyway?", default_yes=False)
 
+
 # ---------------------------------------------------------------------------
 # Core upgrade logic
 # ---------------------------------------------------------------------------
 
-def build_checks(window=None, pre_upgrade_orphans=None, skip=False):
-    """Return the ordered list of Check objects (mirrors mintupgrade.py:letsgo)."""
+def build_checks(pre_upgrade_orphans=None, skip=False):
+    """
+    Return the ordered list of Check objects for a full upgrade.
+
+    When skip=True (APT repos already point to destination), some Phase 1
+    checks are omitted because they are no longer meaningful, and the first
+    APTCacheCheck in Phase 1 is also skipped (Phase 2 will run it anyway).
+    The Phase 2 APTCacheCheck is always included.
+    """
     if pre_upgrade_orphans is None:
         pre_upgrade_orphans = []
 
     checks = []
 
-    # Phase 1
+    # --- Phase 1: Preparation ---
     checks.append(VersionCheck())
     checks.append(PowerCheck())
     if not skip:
-        checks.append(APTCacheCheck(window))
+        # Only meaningful before repos are switched
+        checks.append(APTCacheCheck(None))
     checks.append(TimeshiftCheck())
     checks.append(APTHeldCheck())
     checks.append(APTRepoCheck())
@@ -184,13 +209,13 @@ def build_checks(window=None, pre_upgrade_orphans=None, skip=False):
         checks.append(APTForeignCheck())
         checks.append(APTOrphanCheck(pre_upgrade_orphans, None))
 
-    # Phase 2
+    # --- Phase 2: Simulation and Download ---
     checks.append(UpdateReposCheck())
-    checks.append(APTCacheCheck(window))
+    checks.append(APTCacheCheck(None))   # always run after repo switch
     checks.append(SimulateUpgradeCheck())
-    checks.append(DownloadCheck(window))
+    checks.append(DownloadCheck(None))
 
-    # Phase 3
+    # --- Phase 3: Upgrade ---
     checks.append(InhibitCheck())
     checks.append(PreUpgradeCheck())
     checks.append(DistUpgradeCheck())
@@ -201,21 +226,22 @@ def build_checks(window=None, pre_upgrade_orphans=None, skip=False):
 
     return checks
 
-def build_checks_only(window=None, pre_upgrade_orphans=None):
-    """Return only Phase-1 checks (no changes applied)."""
+
+def build_checks_only(pre_upgrade_orphans=None):
+    """Return only Phase-1 checks (read-only, no changes applied)."""
     if pre_upgrade_orphans is None:
         pre_upgrade_orphans = []
 
-    checks = []
-    checks.append(VersionCheck())
-    checks.append(PowerCheck())
-    checks.append(APTCacheCheck(window))
-    checks.append(TimeshiftCheck())
-    checks.append(APTHeldCheck())
-    checks.append(APTRepoCheck())
-    checks.append(APTForeignCheck())
-    checks.append(APTOrphanCheck(pre_upgrade_orphans, None))
-    return checks
+    return [
+        VersionCheck(),
+        PowerCheck(),
+        APTCacheCheck(None),
+        TimeshiftCheck(),
+        APTHeldCheck(),
+        APTRepoCheck(),
+        APTForeignCheck(),
+        APTOrphanCheck(pre_upgrade_orphans, None),
+    ]
 
 
 PHASE_LABELS = {
@@ -295,6 +321,7 @@ def handle_check_result(check, auto_yes=False, check_only=False):
                     fatal("The fix raised an exception:")
                     traceback.print_exc()
                     return False
+
                 # Re-run after fix
                 section(f"Re-checking: {check.title}")
                 run_check_sync(check)
@@ -339,32 +366,63 @@ def handle_check_result(check, auto_yes=False, check_only=False):
     return True
 
 
-def apply_settings(args):
-    """Override GSettings keys via environment so checks read them."""
+def apply_skip_flags(args):
+    """
+    Apply --skip-* flags by temporarily overriding GSettings for this process.
+
+    We save the original values and restore them on exit so the user's
+    persistent settings are never modified.
+    """
     import gi
     gi.require_version("Gio", "2.0")
     from gi.repository import Gio
+
     settings = Gio.Settings(schema_id="com.linuxmint.mintupgrade")
-    if args.skip_timeshift:
-        settings.set_boolean("check-timeshift", False)
-    if args.skip_version:
-        settings.set_boolean("check-version", False)
-    if args.skip_updates:
-        settings.set_boolean("check-updates", False)
+
+    originals = {}
+
+    flag_map = {
+        "skip_timeshift": "check-timeshift",
+        "skip_version":   "check-version",
+        "skip_updates":   "check-updates",
+    }
+
+    for attr, key in flag_map.items():
+        if getattr(args, attr, False):
+            originals[key] = settings.get_boolean(key)
+            settings.set_boolean(key, False)
+
+    if originals:
+        import atexit
+
+        def _restore():
+            for key, value in originals.items():
+                settings.set_boolean(key, value)
+
+        atexit.register(_restore)
 
 
 def run_upgrade(auto_yes=False, check_only=False):
-    """Main upgrade routine. Returns exit code (0=success, 1=failure)."""
+    """
+    Main upgrade routine.
+
+    Collects pre-upgrade orphans via APTOrphanCheck so that
+    APTRemoveOrphansCheck can act on them later.
+
+    Returns exit code: 0 on success, 1 on failure.
+    """
+    global _last_phase
+    _last_phase = None  # reset phase tracking for each run
 
     if check_only:
-        header(f"mintupgrade — Pre-upgrade checks only")
-        header(f"Target: {DESTINATION}")
+        header("mintupgrade — Pre-upgrade checks only")
     else:
         header(f"mintupgrade — Upgrade to {DESTINATION}")
 
     print()
     info(f"Origin : {ORIGIN}")
     info(f"Target : {DESTINATION}")
+
     if check_only:
         info("Mode   : Check only (no changes will be made)")
     else:
@@ -379,7 +437,10 @@ def run_upgrade(auto_yes=False, check_only=False):
                 info("Upgrade cancelled.")
                 return 0
 
+    # This list is populated by APTOrphanCheck and consumed by
+    # APTRemoveOrphansCheck. Both receive the same list object.
     pre_upgrade_orphans = []
+
     skip = apt_points_to_destination()
     if skip:
         info("Note: APT repositories already point towards the destination.")
@@ -396,9 +457,10 @@ def run_upgrade(auto_yes=False, check_only=False):
     for check in checks:
         run_check_sync(check)
         cont = handle_check_result(check, auto_yes=auto_yes, check_only=check_only)
-        if check.result == RESULT_SUCCESS or (check.result in (RESULT_INFO, RESULT_WARNING) and cont):
+
+        if cont:
             passed += 1
-        if not cont:
+        else:
             failed += 1
             break
 
@@ -412,7 +474,8 @@ def run_upgrade(auto_yes=False, check_only=False):
         return 1
     else:
         if check_only:
-            print(_c(C.BOLD + C.GREEN, f"  ✔  All {passed} checks passed. System is ready to upgrade."))
+            print(_c(C.BOLD + C.GREEN,
+                f"  ✔  All {passed} checks passed. System is ready to upgrade."))
         else:
             print(_c(C.BOLD + C.GREEN,
                 f"  ✔  Upgrade completed successfully! ({passed} steps, {elapsed:.0f}s)"))
@@ -438,8 +501,9 @@ def main():
         "command",
         nargs="?",
         choices=["check", "upgrade"],
-        default="upgrade",
-        help="'check' runs pre-upgrade checks only; 'upgrade' (default) performs the full upgrade.",
+        # Safe default: only inspect, never modify the system unexpectedly.
+        default="check",
+        help="'check' (default) runs pre-upgrade checks only; 'upgrade' performs the full upgrade.",
     )
     parser.add_argument(
         "--no-color",
@@ -479,7 +543,7 @@ def main():
             "  Try:  sudo mintupgrade-cli\n"))
         sys.exit(1)
 
-    apply_settings(args)
+    apply_skip_flags(args)
 
     check_only = (args.command == "check")
 
