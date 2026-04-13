@@ -1,0 +1,497 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+"""
+mintupgrade-cli — Command-line interface for the Linux Mint Upgrade Tool.
+
+Usage:
+  mintupgrade-cli                    Run the full interactive upgrade wizard
+  mintupgrade-cli check              Run pre-upgrade checks only (no changes)
+  mintupgrade-cli upgrade            Run the full upgrade non-interactively
+  mintupgrade-cli --help / -h        Show this help message
+
+Options:
+  --no-color                         Disable colored output
+  --skip-timeshift                   Skip the Timeshift snapshot check
+  --skip-version                     Skip the OS version check
+  --skip-updates                     Skip the up-to-date check
+  --yes / -y                         Auto-confirm informational prompts (orphan packages, simulation summary)
+"""
+
+import sys
+import os
+import argparse
+import subprocess
+import traceback
+import time
+import datetime
+
+# ---------------------------------------------------------------------------
+# Bootstrap: allow running directly from the source tree or installed path
+# ---------------------------------------------------------------------------
+LIB_PATH = "/usr/lib/linuxmint/mintupgrade"
+if os.path.isdir(LIB_PATH):
+    sys.path.insert(0, LIB_PATH)
+else:
+    # Running from the repo root
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../lib/linuxmint/mintupgrade"))
+
+import gettext
+import locale
+
+APP = "mintupgrade"
+LOCALE_DIR = "/usr/share/locale"
+locale.bindtextdomain(APP, LOCALE_DIR)
+gettext.bindtextdomain(APP, LOCALE_DIR)
+gettext.textdomain(APP)
+_ = gettext.gettext
+
+from common import *
+from constants import *
+from checks import *
+from apt_utils import *
+
+# ---------------------------------------------------------------------------
+# Terminal colour helpers
+# ---------------------------------------------------------------------------
+
+USE_COLOR = True
+
+class C:
+    RESET   = "\033[0m"
+    BOLD    = "\033[1m"
+    RED     = "\033[91m"
+    GREEN   = "\033[92m"
+    YELLOW  = "\033[93m"
+    BLUE    = "\033[94m"
+    MAGENTA = "\033[95m"
+    CYAN    = "\033[96m"
+    WHITE   = "\033[97m"
+
+def _c(color, text):
+    if USE_COLOR:
+        return f"{color}{text}{C.RESET}"
+    return text
+
+def header(text):
+    width = 60
+    bar = "═" * width
+    print()
+    print(_c(C.BOLD + C.CYAN, f"╔{bar}╗"))
+    print(_c(C.BOLD + C.CYAN, f"║  {text:<{width-2}}║"))
+    print(_c(C.BOLD + C.CYAN, f"╚{bar}╝"))
+
+def section(text):
+    print()
+    print(_c(C.BOLD + C.BLUE, f"  ▶  {text}"))
+    print(_c(C.BLUE, "  " + "─" * 55))
+
+def ok(text):
+    print(_c(C.GREEN,   f"  ✔  {text}"))
+
+def info(text):
+    print(_c(C.CYAN,    f"  ℹ  {text}"))
+
+def warn(text):
+    print(_c(C.YELLOW,  f"  ⚠  {text}"))
+
+def error(text):
+    print(_c(C.RED,     f"  ✘  {text}"))
+
+def fatal(text):
+    print(_c(C.BOLD + C.RED, f"\n  ✘  FATAL: {text}\n"))
+
+def print_table(table_list):
+    """Pretty-print a TableList to the terminal."""
+    if table_list.show_column_names and table_list.columns and table_list.columns != [""]:
+        header_row = "  " + "  |  ".join(
+            _c(C.BOLD, col) for col in table_list.columns
+        )
+        print(header_row)
+        print("  " + "─" * 55)
+    for row in table_list.values:
+        print("      " + "  |  ".join(str(v) for v in row))
+
+def render_info(info_list):
+    """Render check.info (mixed strings / TableList) to the terminal."""
+    for item in info_list:
+        if isinstance(item, TableList):
+            print_table(item)
+        elif item == "---":
+            print("  " + "─" * 55)
+        else:
+            # Strip pango markup (<b>, etc.)
+            clean = item.replace("<b>", "").replace("</b>", "")
+            info(clean)
+
+# ---------------------------------------------------------------------------
+# Synchronous check runner  (the GUI uses threads + GLib.idle_add)
+# ---------------------------------------------------------------------------
+
+def run_check_sync(check):
+    """Run a Check synchronously and return it."""
+    check.clean()
+    try:
+        check.do_run()
+    except Exception:
+        check.message = traceback.format_exc()
+        check.result = RESULT_EXCEPTION
+    check.finished = True
+    return check
+
+# ---------------------------------------------------------------------------
+# Interactive prompt helpers
+# ---------------------------------------------------------------------------
+
+def ask_yesno(prompt, default_yes=False):
+    """Prompt the user for yes/no. Returns True for yes."""
+    hint = "[Y/n]" if default_yes else "[y/N]"
+    try:
+        answer = input(f"\n  {_c(C.BOLD, prompt)} {hint}: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    if answer == "":
+        return default_yes
+    return answer in ("y", "yes")
+
+def ask_continue(auto_yes=False):
+    """Ask the user whether to continue after a warning/info."""
+    if auto_yes:
+        info("Auto-confirming (--yes flag).")
+        return True
+    return ask_yesno("Continue anyway?", default_yes=False)
+
+# ---------------------------------------------------------------------------
+# Core upgrade logic
+# ---------------------------------------------------------------------------
+
+def build_checks(window=None, pre_upgrade_orphans=None, skip=False):
+    """Return the ordered list of Check objects (mirrors mintupgrade.py:letsgo)."""
+    if pre_upgrade_orphans is None:
+        pre_upgrade_orphans = []
+
+    checks = []
+
+    # Phase 1
+    checks.append(VersionCheck())
+    checks.append(PowerCheck())
+    if not skip:
+        checks.append(APTCacheCheck(window))
+    checks.append(TimeshiftCheck())
+    checks.append(APTHeldCheck())
+    checks.append(APTRepoCheck())
+    if not skip:
+        checks.append(APTForeignCheck())
+        checks.append(APTOrphanCheck(pre_upgrade_orphans, None))
+
+    # Phase 2
+    checks.append(UpdateReposCheck())
+    checks.append(APTCacheCheck(window))
+    checks.append(SimulateUpgradeCheck())
+    checks.append(DownloadCheck(window))
+
+    # Phase 3
+    checks.append(InhibitCheck())
+    checks.append(PreUpgradeCheck())
+    checks.append(DistUpgradeCheck())
+    checks.append(APTForeignCheck())
+    if not skip:
+        checks.append(APTRemoveOrphansCheck(pre_upgrade_orphans, None))
+    checks.append(PostUpgradeCheck())
+
+    return checks
+
+def build_checks_only(window=None, pre_upgrade_orphans=None):
+    """Return only Phase-1 checks (no changes applied)."""
+    if pre_upgrade_orphans is None:
+        pre_upgrade_orphans = []
+
+    checks = []
+    checks.append(VersionCheck())
+    checks.append(PowerCheck())
+    checks.append(APTCacheCheck(window))
+    checks.append(TimeshiftCheck())
+    checks.append(APTHeldCheck())
+    checks.append(APTRepoCheck())
+    checks.append(APTForeignCheck())
+    checks.append(APTOrphanCheck(pre_upgrade_orphans, None))
+    return checks
+
+
+PHASE_LABELS = {
+    VersionCheck:          "Phase 1",
+    PowerCheck:            "Phase 1",
+    APTCacheCheck:         "Phase 1",
+    TimeshiftCheck:        "Phase 1",
+    APTHeldCheck:          "Phase 1",
+    APTRepoCheck:          "Phase 1",
+    APTForeignCheck:       "Phase 1",
+    APTOrphanCheck:        "Phase 1",
+    UpdateReposCheck:      "Phase 2",
+    SimulateUpgradeCheck:  "Phase 2",
+    DownloadCheck:         "Phase 2",
+    InhibitCheck:          "Phase 3",
+    PreUpgradeCheck:       "Phase 3",
+    DistUpgradeCheck:      "Phase 3",
+    APTRemoveOrphansCheck: "Phase 3",
+    PostUpgradeCheck:      "Phase 3",
+}
+
+PHASE_NAMES = {
+    "Phase 1": "Preparation",
+    "Phase 2": "Simulation and Download",
+    "Phase 3": "Upgrade",
+}
+
+_last_phase = None
+
+
+def print_phase_header_if_needed(check):
+    global _last_phase
+    phase = PHASE_LABELS.get(type(check))
+    if phase and phase != _last_phase:
+        _last_phase = phase
+        header(f"{phase}: {PHASE_NAMES.get(phase, '')}")
+
+
+def handle_check_result(check, auto_yes=False, check_only=False):
+    """
+    Display the result of a check and decide whether to continue.
+    Returns True to continue, False to abort.
+    """
+    print_phase_header_if_needed(check)
+    section(check.title)
+
+    if check.result == RESULT_SUCCESS:
+        ok("Passed")
+        return True
+
+    if check.result == RESULT_EXCEPTION:
+        fatal("An unexpected exception occurred:")
+        print(check.message)
+        return False
+
+    # Print main message
+    if check.message:
+        if check.result == RESULT_ERROR:
+            error(check.message)
+        elif check.result == RESULT_WARNING:
+            warn(check.message)
+        elif check.result == RESULT_INFO:
+            info(check.message)
+
+    # Print additional info
+    render_info(check.info)
+
+    if check.result == RESULT_ERROR:
+        # Offer auto-fix if available
+        if check.fix is not None:
+            print()
+            if auto_yes or ask_yesno("A fix is available. Apply it now?", default_yes=True):
+                section(f"Applying fix for: {check.title}")
+                try:
+                    check.fix()
+                except Exception:
+                    fatal("The fix raised an exception:")
+                    traceback.print_exc()
+                    return False
+                # Re-run after fix
+                section(f"Re-checking: {check.title}")
+                run_check_sync(check)
+                if check.result == RESULT_SUCCESS:
+                    ok("Passed after fix")
+                    return True
+                else:
+                    error("Still failing after fix. Aborting.")
+                    if check.message:
+                        error(check.message)
+                    render_info(check.info)
+                    return False
+            else:
+                error("Fix refused. Aborting upgrade.")
+                return False
+        else:
+            error("Cannot continue. Resolve this issue manually and re-run.")
+            return False
+
+    elif check.result == RESULT_WARNING:
+        if check.fix is not None:
+            print()
+            if auto_yes or ask_yesno("A fix is available. Apply it?", default_yes=True):
+                try:
+                    check.fix()
+                except Exception:
+                    warn("Fix raised an exception (continuing anyway):")
+                    traceback.print_exc()
+        else:
+            if not ask_continue(auto_yes):
+                return False
+        return True
+
+    elif check.result == RESULT_INFO:
+        # Simulation summary, orphan list, etc. — just ask to continue
+        if check_only:
+            return True
+        if not ask_continue(auto_yes):
+            return False
+        return True
+
+    return True
+
+
+def apply_settings(args):
+    """Override GSettings keys via environment so checks read them."""
+    import gi
+    gi.require_version("Gio", "2.0")
+    from gi.repository import Gio
+    settings = Gio.Settings(schema_id="com.linuxmint.mintupgrade")
+    if args.skip_timeshift:
+        settings.set_boolean("check-timeshift", False)
+    if args.skip_version:
+        settings.set_boolean("check-version", False)
+    if args.skip_updates:
+        settings.set_boolean("check-updates", False)
+
+
+def run_upgrade(auto_yes=False, check_only=False):
+    """Main upgrade routine. Returns exit code (0=success, 1=failure)."""
+
+    if check_only:
+        header(f"mintupgrade — Pre-upgrade checks only")
+        header(f"Target: {DESTINATION}")
+    else:
+        header(f"mintupgrade — Upgrade to {DESTINATION}")
+
+    print()
+    info(f"Origin : {ORIGIN}")
+    info(f"Target : {DESTINATION}")
+    if check_only:
+        info("Mode   : Check only (no changes will be made)")
+    else:
+        info("Mode   : Full upgrade")
+
+    if not check_only:
+        print()
+        if not auto_yes:
+            print(_c(C.BOLD + C.YELLOW,
+                "  This will upgrade your system. Make sure you have a Timeshift snapshot."))
+            if not ask_yesno("Proceed with the upgrade?", default_yes=False):
+                info("Upgrade cancelled.")
+                return 0
+
+    pre_upgrade_orphans = []
+    skip = apt_points_to_destination()
+    if skip:
+        info("Note: APT repositories already point towards the destination.")
+
+    if check_only:
+        checks = build_checks_only(pre_upgrade_orphans=pre_upgrade_orphans)
+    else:
+        checks = build_checks(pre_upgrade_orphans=pre_upgrade_orphans, skip=skip)
+
+    passed = 0
+    failed = 0
+    start_time = time.time()
+
+    for check in checks:
+        run_check_sync(check)
+        cont = handle_check_result(check, auto_yes=auto_yes, check_only=check_only)
+        if check.result == RESULT_SUCCESS or (check.result in (RESULT_INFO, RESULT_WARNING) and cont):
+            passed += 1
+        if not cont:
+            failed += 1
+            break
+
+    elapsed = time.time() - start_time
+    print()
+    print("  " + "─" * 55)
+
+    if failed:
+        fatal(f"Upgrade aborted. {passed} checks passed, {failed} failed.")
+        print(f"  Elapsed: {elapsed:.0f}s")
+        return 1
+    else:
+        if check_only:
+            print(_c(C.BOLD + C.GREEN, f"  ✔  All {passed} checks passed. System is ready to upgrade."))
+        else:
+            print(_c(C.BOLD + C.GREEN,
+                f"  ✔  Upgrade completed successfully! ({passed} steps, {elapsed:.0f}s)"))
+            print()
+            info("Please reboot your computer to complete the upgrade.")
+        return 0
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main():
+    global USE_COLOR
+
+    parser = argparse.ArgumentParser(
+        prog="mintupgrade-cli",
+        description="Command-line interface for the Linux Mint Upgrade Tool.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    parser.add_argument(
+        "command",
+        nargs="?",
+        choices=["check", "upgrade"],
+        default="upgrade",
+        help="'check' runs pre-upgrade checks only; 'upgrade' (default) performs the full upgrade.",
+    )
+    parser.add_argument(
+        "--no-color",
+        action="store_true",
+        help="Disable coloured output.",
+    )
+    parser.add_argument(
+        "--skip-timeshift",
+        action="store_true",
+        help="Skip the Timeshift snapshot check.",
+    )
+    parser.add_argument(
+        "--skip-version",
+        action="store_true",
+        help="Skip the OS version compatibility check.",
+    )
+    parser.add_argument(
+        "--skip-updates",
+        action="store_true",
+        help="Skip the up-to-date check.",
+    )
+    parser.add_argument(
+        "--yes", "-y",
+        action="store_true",
+        help="Auto-confirm all prompts (non-interactive mode).",
+    )
+
+    args = parser.parse_args()
+
+    if args.no_color:
+        USE_COLOR = False
+
+    # Root is required for package operations
+    if os.geteuid() != 0:
+        print(_c(C.BOLD + C.RED,
+            "\n  This tool must be run as root.\n"
+            "  Try:  sudo mintupgrade-cli\n"))
+        sys.exit(1)
+
+    apply_settings(args)
+
+    check_only = (args.command == "check")
+
+    try:
+        exit_code = run_upgrade(auto_yes=args.yes, check_only=check_only)
+    except KeyboardInterrupt:
+        print()
+        warn("Interrupted by user.")
+        sys.exit(130)
+
+    sys.exit(exit_code)
+
+
+if __name__ == "__main__":
+    main()
