@@ -438,6 +438,14 @@ class APTRepoCheck(Check):
             c.setopt(pycurl.FOLLOWLOCATION, 1)
             c.setopt(pycurl.NOBODY, 1)
             c.setopt(pycurl.OPT_FILETIME, 1)
+            proxy = None
+            proxy_env_names = ['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy']
+            for pname in proxy_env_names:
+                if os.environ[pname]:
+                    proxy = pname
+                    break
+            if proxy is not None:
+                c.setopt(pycurl.PROXY, proxy)
             c.perform()
             filetime = c.getinfo(pycurl.INFO_FILETIME)
             if filetime < 0:
