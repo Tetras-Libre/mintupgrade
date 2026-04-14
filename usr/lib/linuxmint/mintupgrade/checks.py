@@ -448,7 +448,7 @@ class APTRepoCheck(Check):
             proxy_env_names = ['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy']
             for pname in proxy_env_names:
                 if os.environ[pname]:
-                    proxy = pname
+                    proxy = os.environ[pname]
                     break
             if proxy is not None:
                 c.setopt(pycurl.PROXY, proxy)
