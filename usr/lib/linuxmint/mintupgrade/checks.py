@@ -16,7 +16,10 @@ from pathlib import Path
 import apt
 import apt_pkg
 import aptsources.sourceslist
-import mintcommon.aptdaemon
+try:
+    import mintcommon.aptdaemon
+except ModuleNotFoundError:
+    import aptkit as aptdaemon
 
 import pycurl
 
